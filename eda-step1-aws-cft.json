@@ -1,0 +1,490 @@
+{
+    "AWSTemplateFormatVersion": "2010-09-09",
+    "Resources": {
+      "OrderQueue": {
+        "Type": "AWS::SQS::Queue",
+        "Properties": {
+          "QueueName": "OrderQueue.fifo",
+          "FifoQueue": true,
+          "ContentBasedDeduplication": true,
+          "VisibilityTimeout": 30,
+          "MessageRetentionPeriod": 345600
+        }
+      },
+      "OrderProcessorLambda": {
+        "Type": "AWS::Lambda::Function",
+        "Properties": {
+          "FunctionName": "OrderProcessor",
+          "Runtime": "python3.12",
+          "Handler": "index.lambda_handler",
+          "Role": {
+            "Fn::GetAtt": [
+              "LambdaExecutionRole",
+              "Arn"
+            ]
+          },
+          "Code": {
+            "ZipFile": {
+              "Fn::Join": [
+                "\n",
+                [
+                  "def lambda_handler(event, context):",
+                  "    for record in event['Records']:",
+                  "        print(f\"Processing message: {record['body']}\")",
+                  "    return {'statusCode': 200}"
+                ]
+              ]
+            }
+          },
+          "Timeout": 15,
+          "MemorySize": 128
+        }
+      },
+      "LambdaExecutionRole": {
+        "Type": "AWS::IAM::Role",
+        "Properties": {
+          "AssumeRolePolicyDocument": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Principal": {
+                  "Service": [
+                    "lambda.amazonaws.com"
+                  ]
+                },
+                "Action": [
+                  "sts:AssumeRole"
+                ]
+              }
+            ]
+          },
+          "Policies": [
+            {
+              "PolicyName": "SQSAccessPolicy",
+              "PolicyDocument": {
+                "Version": "2012-10-17",
+                "Statement": [
+                  {
+                    "Effect": "Allow",
+                    "Action": [
+                      "sqs:ReceiveMessage",
+                      "sqs:DeleteMessage",
+                      "sqs:GetQueueAttributes"
+                    ],
+                    "Resource": {
+                      "Fn::GetAtt": [
+                        "OrderQueue",
+                        "Arn"
+                      ]
+                    }
+                  },
+                  {
+                    "Effect": "Allow",
+                    "Action": [
+                      "logs:CreateLogGroup",
+                      "logs:CreateLogStream",
+                      "logs:PutLogEvents"
+                    ],
+                    "Resource": "arn:aws:logs:*:*:*"
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "SQSEventSourceMapping": {
+        "Type": "AWS::Lambda::EventSourceMapping",
+        "Properties": {
+          "BatchSize": 10,
+          "EventSourceArn": {
+            "Fn::GetAtt": [
+              "OrderQueue",
+              "Arn"
+            ]
+          },
+          "FunctionName": {
+            "Ref": "OrderProcessorLambda"
+          },
+          "Enabled": true,
+          "MaximumBatchingWindowInSeconds": 5
+        }
+      },
+      "ApiGatewaySqsRole": {
+        "Type": "AWS::IAM::Role",
+        "Properties": {
+          "AssumeRolePolicyDocument": {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Principal": {
+                  "Service": [
+                    "apigateway.amazonaws.com"
+                  ]
+                },
+                "Action": [
+                  "sts:AssumeRole"
+                ]
+              }
+            ]
+          },
+          "Policies": [
+            {
+              "PolicyName": "ApiGatewaySqsPolicy",
+              "PolicyDocument": {
+                "Version": "2012-10-17",
+                "Statement": [
+                  {
+                    "Effect": "Allow",
+                    "Action": [
+                      "sqs:SendMessage"
+                    ],
+                    "Resource": {
+                      "Fn::GetAtt": [
+                        "OrderQueue",
+                        "Arn"
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "OrderApi": {
+        "Type": "AWS::ApiGateway::RestApi",
+        "Properties": {
+          "Name": "OrderAPI",
+          "Description": "API for processing orders",
+          "EndpointConfiguration": {
+            "Types": [
+              "REGIONAL"
+            ]
+          }
+        }
+      },
+      "OrderResource": {
+        "Type": "AWS::ApiGateway::Resource",
+        "Properties": {
+          "RestApiId": {
+            "Ref": "OrderApi"
+          },
+          "ParentId": {
+            "Fn::GetAtt": [
+              "OrderApi",
+              "RootResourceId"
+            ]
+          },
+          "PathPart": "order"
+        }
+      },
+      "OrderMethod": {
+        "Type": "AWS::ApiGateway::Method",
+        "Properties": {
+          "RestApiId": {
+            "Ref": "OrderApi"
+          },
+          "ResourceId": {
+            "Ref": "OrderResource"
+          },
+          "HttpMethod": "POST",
+          "AuthorizationType": "NONE",
+          "Integration": {
+            "Type": "AWS",
+            "IntegrationHttpMethod": "POST",
+            "Uri": {
+              "Fn::Sub": "arn:aws:apigateway:${AWS::Region}:sqs:path/${AWS::AccountId}/OrderQueue.fifo"
+            },
+            "RequestParameters": {
+              "integration.request.header.Content-Type": "'application/x-www-form-urlencoded'"
+            },
+            "RequestTemplates": {
+              "application/json": "Action=SendMessage&MessageBody=$input.body&MessageGroupId=$context.requestId&MessageDeduplicationId=$context.requestId"
+            },
+            "IntegrationResponses": [
+              {
+                "StatusCode": 200,
+                "ResponseTemplates": {
+                  "application/json": "{\"status\": \"Order received\"}"
+                }
+              }
+            ]
+          },
+          "MethodResponses": [
+            {
+              "StatusCode": 200,
+              "ResponseModels": {
+                "application/json": "Empty"
+              }
+            }
+          ]
+        }
+      }
+    },
+    "OrdersTable": {
+      "Type": "AWS::DynamoDB::Table",
+      "Properties": {
+        "TableName": "OrdersTable",
+        "AttributeDefinitions": [
+          {
+            "AttributeName": "CustomerId",
+            "AttributeType": "S"
+          },
+          {
+            "AttributeName": "OrderId",
+            "AttributeType": "S"
+          },
+          {
+            "AttributeName": "RestaurantId",
+            "AttributeType": "S"
+          },
+          {
+            "AttributeName": "OrderStatus",
+            "AttributeType": "S"
+          },
+          {
+            "AttributeName": "OrderDate",
+            "AttributeType": "S"
+          }
+        ],
+        "GlobalSecondaryIndexes": [
+          {
+            "IndexName": "RestaurantOrdersIndex",
+            "KeySchema": [
+              {
+                "AttributeName": "RestaurantId",
+                "KeyType": "HASH"
+              },
+              {
+                "AttributeName": "OrderDate",
+                "KeyType": "RANGE"
+              }
+            ],
+            "Projection": {
+              "ProjectionType": "INCLUDE",
+              "NonKeyAttributes": [
+                "OrderStatus",
+                "OrderTotalAmount",
+                "Quantity"
+              ]
+            }
+          },
+          {
+            "IndexName": "StatusDateIndex",
+            "KeySchema": [
+              {
+                "AttributeName": "OrderStatus",
+                "KeyType": "HASH"
+              },
+              {
+                "AttributeName": "OrderDate",
+                "KeyType": "RANGE"
+              }
+            ],
+            "Projection": {
+              "ProjectionType": "ALL"
+            }
+          }
+        ],
+        "BillingMode": "PAY_PER_REQUEST",
+        "StreamSpecification": {
+          "StreamViewType": "NEW_IMAGE"
+        }
+      }
+    },
+    "OrdersLambda": {
+      "Type": "AWS::Lambda::Function",
+      "Properties": {
+        "FunctionName": "OrdersProcessor",
+        "Runtime": "python3.12",
+        "Handler": "index.lambda_handler",
+        "Role": {
+          "Fn::GetAtt": [
+            "LambdaDynamoDBRole",
+            "Arn"
+          ]
+        },
+        "Code": {
+          "ZipFile": {
+            "Fn::Join": [
+              "\n",
+              [
+                "import boto3",
+                "import json",
+                "from boto3.dynamodb.conditions import Key",
+                "",
+                "dynamodb = boto3.resource('dynamodb')",
+                "table = dynamodb.Table('OrdersTable')",
+                "",
+                "def lambda_handler(event, context):",
+                "    # Insert record example",
+                "    table.put_item(",
+                "        Item={",
+                "            'CustomerId': '123',",
+                "            'OrderId': 'ORD-001',",
+                "            'RestaurantId': 'REST-001',",
+                "            'OrderStatus': 'PENDING',",
+                "            'OrderTotalAmount': '29.99',",
+                "            'OrderDetails': {'items': ['item1', 'item2']}",
+                "        }",
+                "    )",
+                "    ",
+                "    # Query example",
+                "    response = table.query(",
+                "        KeyConditionExpression=Key('CustomerId').eq('123')",
+                "    )",
+                "    return response['Items']"
+              ]
+            ]
+          }
+        },
+        "Timeout": 15,
+        "MemorySize": 256
+      }
+    },
+    "LambdaDynamoDBRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": [
+                  "lambda.amazonaws.com"
+                ]
+              },
+              "Action": [
+                "sts:AssumeRole"
+              ]
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "DynamoDBAccess",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "dynamodb:PutItem",
+                    "dynamodb:Query",
+                    "dynamodb:GetItem",
+                    "dynamodb:UpdateItem"
+                  ],
+                  "Resource": [
+                    {
+                      "Fn::GetAtt": [
+                        "OrdersTable",
+                        "Arn"
+                      ]
+                    },
+                    {
+                      "Fn::Join": [
+                        "/",
+                        [
+                          {
+                            "Fn::GetAtt": [
+                              "OrdersTable",
+                              "Arn"
+                            ]
+                          },
+                          "*"
+                        ]
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "logs:CreateLogGroup",
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents"
+                  ],
+                  "Resource": "arn:aws:logs:*:*:*"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "Outputs": {
+      "ApiEndpoint": {
+        "Description": "API Gateway endpoint URL for the Order API",
+        "Value": {
+          "Fn::Sub": "https://${OrderApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+        }
+      },
+      "QueueURL": {
+        "Description": "URL of the FIFO SQS Queue",
+        "Value": {
+          "Ref": "OrderQueue"
+        }
+      },
+      "RoleARN": {
+        "Description": "ARN of the IAM Role for API Gateway to access SQS",
+        "Value": {
+          "Fn::GetAtt": [
+            "ApiGatewaySqsRole",
+            "Arn"
+          ]
+        }
+      },
+      "QueueARN": {
+        "Description": "ARN of the FIFO SQS Queue",
+        "Value": {
+          "Fn::GetAtt": [
+            "OrderQueue",
+            "Arn"
+          ]
+        }
+      },
+      "LambdaARN": {
+        "Description": "ARN of the processing Lambda function",
+        "Value": {
+          "Fn::GetAtt": [
+            "OrderProcessorLambda",
+            "Arn"
+          ]
+        }
+      },
+      "TableName": {
+        "Description": "Name of the DynamoDB Table",
+        "Value": {
+          "Ref": "OrdersTable"
+        }
+      },
+      "TableArn": {
+        "Description": "ARN of the DynamoDB Table",
+        "Value": {
+          "Fn::GetAtt": [
+            "OrdersTable",
+            "Arn"
+          ]
+        }
+      },
+      "LambdaArn": {
+        "Description": "ARN of the Orders Processor Lambda",
+        "Value": {
+          "Fn::GetAtt": [
+            "OrdersLambda",
+            "Arn"
+          ]
+        }
+      },
+      "DynamoDBTable": {
+        "Description": "Orders Table Name",
+        "Value": {
+          "Ref": "OrdersTable"
+        }
+      }
+    }
+  }
